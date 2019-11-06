@@ -1,0 +1,54 @@
+---
+title: "R Notebook"
+output: pdf_notebook
+---
+
+```{r include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(rlang)
+library(mosaicData)
+library(cvTools)
+library(GGally)
+library(caret)
+options(scipen = 999, digits = 5)
+library(stringr)
+```
+
+```{r}
+table <- read.csv(file="train.csv", header=TRUE, sep = ",")
+```
+
+```{r}
+running <- filter(table, NflIdRusher == NflId)
+filtered <- select(running, -c(GameId, PlayId, JerseyNumber, NflId, NflIdRusher))
+
+
+timeDifference <- function(time) {
+  num <- gsub("[:]", "" , str_sub(time, 12, 19), perl=TRUE)
+  hr <- ifelse(str_sub(num, 1, 2) == "00", 24, as.numeric(str_sub(num, 1, 2)))
+  min <- as.numeric(str_sub(num, 3, 4))
+  sec <- as.numeric(str_sub(num, 5, 6))
+  newTime <- 3600*hr + 60 * min + sec
+  return(newTime)
+}
+
+#1)
+filtered$TimeDifference <- 
+  timeDifference(filtered$TimeHandoff) - timeDifference(filtered$TimeSnap)
+
+#2)
+filtered$LeadingScore <- filtered$HomeScoreBeforePlay - filtered$VisitorScoreBeforePlay
+
+#3)
+#if home team has the ball, then the visitor is playing defense.
+#if home team does not have the ball, then the home team is playing defense. 
+filtered$defense <- 
+  ifelse(
+    as.character(filtered$HomeTeamAbbr) == as.character(filtered$PossessionTeam),
+    as.character(filtered$VisitorTeamAbbr) , 
+    as.character(filtered$HomeTeamAbbr) 
+         )
+```
+
+
