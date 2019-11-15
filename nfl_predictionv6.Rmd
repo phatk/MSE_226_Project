@@ -1,0 +1,523 @@
+---
+title: "MS&E 226 Project"
+author: "Peter Karnchanapimonkul (SUNET: phatk), Tyler Coleman (SUNET: colemant)"
+output:
+  pdf_document: default
+---
+
+```{r include=FALSE}
+# install.packages("glmnet")
+library(plotmo) # for plot_glmnet
+library(glmnet)
+library(cvTools)
+library(tidyverse)
+library(tibble)
+library(plotly)
+library(ggplot2)
+library(rlang)
+library(mosaicData)
+library(caret)
+options(scipen = 999, digits = 5)
+library(stringr)
+library(e1071)
+
+library(ada)
+library(class)
+library(parallelSVM)
+```
+
+# IMPORT DATA AND SPLIT INTO TRAIN AND HOLDOUT
+
+```{r}
+NFL_DATA <- read.csv(file = "train.csv", header = TRUE, sep=",")
+NFL_DATA_Run_Observations <- NFL_DATA[(NFL_DATA$NflIdRusher == NFL_DATA$NflId), ]
+
+# split 80:20 for training:test
+set.seed(123)
+training_data = sample(nrow(NFL_DATA_Run_Observations), size = nrow(NFL_DATA_Run_Observations) * 0.8) 
+NFL_DATA_Train = NFL_DATA_Run_Observations[training_data, ] 
+NFL_DATA_Holdout = NFL_DATA_Run_Observations[-training_data, ] # holdout is remaining indices
+#View(NFL_DATA_Train) 
+```
+
+# DATA EXPLORATION OF OUTCOME VARIABLE
+```{r}
+# Explore distribution of the continuos response variable we are predicting. (Yards/carry)
+ggplot(data = NFL_DATA_Train) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  ggtitle("Distribution of Yards")
+
+# Zoom into specifically -10 to 20 yards
+ggplot(data = NFL_DATA_Train) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  coord_cartesian(xlim=c(-10,20), ylim=c(0, 4000)) + 
+  geom_vline(xintercept = 4) + 
+  ggtitle("Distribution of Yards")
+
+# 2, 3, 4, 5 yards in particular are the peaks
+
+# What percentage of runs result in > 10 yards? 0.0956517
+More_Than_10 = NFL_DATA_Train[(NFL_DATA_Train$Yards > 10), ]
+Percentage_Over_10 =  nrow(More_Than_10) / nrow(NFL_DATA_Train) 
+Percentage_Over_10
+
+# What Percentage of runs is < 0 yards? 0.1101101
+Less_Than_0 = NFL_DATA_Train[(NFL_DATA_Train$Yards < 0), ]
+Percentage_under_0 =  nrow(Less_Than_0) / nrow(NFL_DATA_Train) 
+Percentage_under_0
+
+# See if there is difference in run yard by quarter
+
+# FACTOR QUARTER
+NFL_DATA_Train$Quarter = factor(NFL_DATA_Train$Quarter)
+
+# First quarter
+ggplot(data = NFL_DATA_Train[(NFL_DATA_Train$Quarter == 1), ]) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  ggtitle("Distribution of Yards in 1 Quarter")
+
+# Second quarter
+ggplot(data = NFL_DATA_Train[(NFL_DATA_Train$Quarter == 2), ]) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  ggtitle("Distribution of Yards in 2 Quarter")
+
+# Third quarter
+ggplot(data = NFL_DATA_Train[(NFL_DATA_Train$Quarter == 3), ]) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  ggtitle("Distribution of Yards in 3 Quarter")
+
+# Fourth quarter
+ggplot(data = NFL_DATA_Train[(NFL_DATA_Train$Quarter == 4), ]) + 
+  geom_histogram(mapping = aes(x = Yards), bins = 100) + 
+  ggtitle("Distribution of Yards in 4 Quarter")
+```
+
+# DATA EXPLORATION 
+```{r}
+# Plot 3d of X and Y position, and yards gotten
+plot_ly(
+  NFL_DATA_Train, x = ~X, y = ~Y, z = ~Yards, color = ~PossessionTeam) %>%
+  add_markers() %>%
+  layout(
+    scene = list(xaxis = list(title = 'X'),
+                 yaxis = list(title = 'Y'),
+                 zaxis = list(title = 'Yards'))
+  )
+
+# Plot 3d of down and distance, and yards gotten
+plot_ly(
+  NFL_DATA_Train, x = ~Distance, y = ~Down, z = ~Yards, color = ~PossessionTeam) %>%
+  add_markers() %>%
+  layout(
+    scene = list(xaxis = list(title = 'Distance'),
+                 yaxis = list(title = 'Down'),
+                 zaxis = list(title = 'Yards'))
+)
+```
+
+# DATA MANIPULATION AND CLEANING
+Adding the covariates that we want to include, and modififying the dataframe 
+
+```{r}
+NFL_DATA_TRAIN_Modified <- NFL_DATA_Train
+
+# Function to take the difference in time from the dataframe
+timeDifference <- function(time) {
+  num <- gsub("[:]", "" , str_sub(time, 12, 19), perl=TRUE)
+  hr <- ifelse(str_sub(num, 1, 2) == "00", 24, as.numeric(str_sub(num, 1, 2)))
+  min <- as.numeric(str_sub(num, 3, 4))
+  sec <- as.numeric(str_sub(num, 5, 6))
+  newTime <- 3600*hr + 60 * min + sec
+  return(newTime)
+}
+# Add Time_Difference between the snap and the handoff
+NFL_DATA_TRAIN_Modified$TimeDifference <- 
+  timeDifference(NFL_DATA_TRAIN_Modified$TimeHandoff) - timeDifference(NFL_DATA_TRAIN_Modified$TimeSnap)
+
+# Add the Difference in Score by home score - visitor score
+# Difference in Score (Pair with which team is winning (HomeScore-AwayScore))
+NFL_DATA_TRAIN_Modified$HomeScoreAdvantage <- 
+  NFL_DATA_TRAIN_Modified$HomeScoreBeforePlay - NFL_DATA_TRAIN_Modified$VisitorScoreBeforePlay
+
+# Add the age of the running player
+
+# Change the birth dates to strings
+NFL_DATA_TRAIN_Modified$PlayerBirthDate = as.character(NFL_DATA_TRAIN_Modified$PlayerBirthDate)
+# Grab the Year for each of the running player
+Birth_Year = str_sub(NFL_DATA_TRAIN_Modified$PlayerBirthDate, 7, 11)
+# Grab Month of each running player
+Birth_Month = str_sub(NFL_DATA_TRAIN_Modified$PlayerBirthDate, 1, 2)
+# If Born in July (07) Have lived 5/12 of a year. ie (12 - (Birth_Month)) / 12
+How_Much_Of_Year_Lived = (12 - as.numeric(Birth_Month)) / 12
+Years_Lived = NFL_DATA_TRAIN_Modified$Season - as.numeric(Birth_Year)
+Total_Years_Lived = Years_Lived + How_Much_Of_Year_Lived
+NFL_DATA_TRAIN_Modified$PlayerAge = Total_Years_Lived
+
+# Change HEIGHT to inches and continuous
+Feet = as.numeric(str_sub(NFL_DATA_TRAIN_Modified$PlayerHeight, 1, 1)) 
+Inches = as.numeric(str_sub(NFL_DATA_TRAIN_Modified$PlayerHeight, 3, 4)) 
+Heights = (Feet * 12) + Inches
+NFL_DATA_TRAIN_Modified$PlayerHeight = Heights
+
+# Changes GAMECLOCK to Seconds. 
+
+NFL_DATA_TRAIN_Modified$GameClock = as.numeric(NFL_DATA_TRAIN_Modified$GameClock)
+
+# FACTORING VARIABLES INTO CATEGORICAL
+
+# Factor OFFENSE FORMATION 
+NFL_DATA_TRAIN_Modified$OffenseFormation = factor(NFL_DATA_TRAIN_Modified$OffenseFormation) 
+
+# DEFENDERS IN BOX (Need Categorical and Ordinal)
+NFL_DATA_TRAIN_Modified$DefendersInTheBox = factor(NFL_DATA_TRAIN_Modified$DefendersInTheBox)  
+
+```
+
+
+# MORE EXPLORATION WITH NEW/FACTORED COVARIATES (Still before Analyzing Techniques)
+```{r}
+# Plot 3d of offense formation and defenders in box, and yards gotten. More defenders, less yards
+# Might be ok, might only need 2 yards, same for 4th down
+plot_ly(
+  NFL_DATA_TRAIN_Modified, x = ~OffenseFormation, y = ~DefendersInTheBox, z = ~Yards, color = ~PossessionTeam) %>%
+  add_markers() %>%
+  layout(
+    scene = list(xaxis = list(title = 'OffenseForm'),
+                 yaxis = list(title = 'DefendInBox'),
+                 zaxis = list(title = 'Yards'))
+)
+
+# Yards vs. Difference in Score, Color = Quarter
+ggplot(NFL_DATA_TRAIN_Modified, aes(x=HomeScoreAdvantage, y=Yards, color = Quarter )) +
+  geom_point(size=2, shape=23)
+# Difference in score spreads out depending on the quarter (makes sense)
+# Overtime looks to have highest average yards
+# 4th quarter more run plays
+
+# Time between handoff and yards, color = offense style 
+ggplot(NFL_DATA_TRAIN_Modified, aes(x=TimeDifference, y=Yards, color = OffenseFormation)) +
+  geom_point(size=2, shape=23)
+
+# GameClock, Quarter, Yards
+plot_ly(
+  NFL_DATA_TRAIN_Modified, x = ~GameClock, y = ~Quarter, z = ~Yards, color = ~factor(DefendersInTheBox)) %>%
+  add_markers() %>%
+  layout(
+    scene = list(xaxis = list(title = 'Game Clock'),
+                 yaxis = list(title = 'Quarter'),
+                 zaxis = list(title = 'Yards'))
+  )
+```
+
+# REFACTOR DEFENDER IN BOX TO INCLUDE ORDINALITY
+``` {r}
+# Leaving them unordered was for graphs above, to look good
+NFL_DATA_TRAIN_Modified$DefendersInTheBox = factor(NFL_DATA_TRAIN_Modified$DefendersInTheBox, order = TRUE, levels= c(2,3,4,5,6,7,8,9,10,11)) 
+
+```
+
+# SELECTION OF COVARIATES FOR ANALYSIS
+
+```{r}
+# Drop columns that are collinear, or we think are not critical to our model
+NFL_DATA_TRAIN_Filtered = select(NFL_DATA_TRAIN_Modified, 
+                                          -GameId, -PlayId, -Team, -S, -A, -Dis,
+                                          -Orientation, -Dir, -DisplayName, -JerseyNumber,
+                                          -YardLine, -FieldPosition, -HomeScoreBeforePlay,
+                                          -VisitorScoreBeforePlay, -NflId, -TimeHandoff,
+                                          -TimeSnap, -PlayerBirthDate, -PlayerCollegeName, -Location,
+                                          -WindSpeed, -WindDirection, -StadiumType, -Turf,-GameWeather,-NflIdRusher, -Stadium) 
+# Turf and stadium type all captured in stadium
+# View(NFL_DATA_TRAIN_Filtered) # drop game weather, captured in Week, and Stadium. Also too many missing values
+```
+
+# NOW THAT HAVE SELECTED COVARIATES. MORE DATA CLEANING, FACTORING, ETC...
+```{r}
+# Need to count how many NA / Empty cells there are for each column
+# summary(NFL_DATA_TRAIN_Filtered)  # changed empty to NA when reading in file
+# GameWeather, Temperature, Humidy all have missing or NA data
+# sum(is.na(NFL_DATA_TRAIN_Filtered$GameWeather))
+# sum(NFL_DATA_TRAIN_Filtered$GameWeather == "")
+
+# Factor the DOWNS, Ordinally
+NFL_DATA_TRAIN_Filtered$Down = factor(as.numeric(NFL_DATA_TRAIN_Filtered$Down), order = TRUE, levels = c(1,2,3,4,5))
+
+# Player WEIGHT 
+NFL_DATA_TRAIN_Filtered$PlayerWeight = as.numeric(NFL_DATA_TRAIN_Filtered$PlayerWeight) 
+
+# Factor POSITION
+NFL_DATA_TRAIN_Filtered$Position = factor(NFL_DATA_TRAIN_Filtered$Position)
+
+# factor POSITION
+NFL_DATA_TRAIN_Filtered$Position = factor(NFL_DATA_TRAIN_Filtered$Position)
+
+# factor SEASON
+NFL_DATA_TRAIN_Filtered$Season = factor(NFL_DATA_TRAIN_Filtered$Season)
+
+
+# DATA CLEANING (REMOVING NA'S, and observations that happen less than 3 times)
+# This was causing issues where one fold has a factor but another fold does not
+
+# Need to delete a row within a column if there is just 1 special case. (Minimun 3 observations)
+
+# DefensePersonnel (reduces observations by 11)
+NFL_DATA_TRAIN_Filtered = NFL_DATA_TRAIN_Filtered[unsplit(table(NFL_DATA_TRAIN_Filtered$DefensePersonnel), NFL_DATA_TRAIN_Filtered$DefensePersonnel) >= 3, ]
+
+# Same for OffensePersonnel (reduces by 18 observations)
+NFL_DATA_TRAIN_Filtered = NFL_DATA_TRAIN_Filtered[unsplit(table(NFL_DATA_TRAIN_Filtered$OffensePersonnel), NFL_DATA_TRAIN_Filtered$OffensePersonnel) >= 3, ]
+
+# Same for Position
+NFL_DATA_TRAIN_Filtered = NFL_DATA_TRAIN_Filtered[unsplit(table(NFL_DATA_TRAIN_Filtered$Position), NFL_DATA_TRAIN_Filtered$Position) >= 3, ]
+
+# Same for Defenders In the Box 
+NFL_DATA_TRAIN_Filtered = NFL_DATA_TRAIN_Filtered[unsplit(table(NFL_DATA_TRAIN_Filtered$DefendersInTheBox), NFL_DATA_TRAIN_Filtered$DefendersInTheBox) >= 3, ]
+
+# Same for Offense Formation
+NFL_DATA_TRAIN_Filtered = NFL_DATA_TRAIN_Filtered[unsplit(table(NFL_DATA_TRAIN_Filtered$OffenseFormation), NFL_DATA_TRAIN_Filtered$OffenseFormation) >= 3, ]
+
+# Need to remove NA Rows: Still 16,758 observations out of ~18,000
+NFL_DATA_TRAIN_Filtered_Final <- na.omit(NFL_DATA_TRAIN_Filtered)
+# View(NFL_DATA_TRAIN_Filtered_Final)
+```
+
+
+## BEGINNING OF ANALYSIS
+
+# Regression with all Covariates
+```{r}
+NFL_Train_Total_Model = lm(Yards ~ ., data=NFL_DATA_TRAIN_Filtered_Final)
+# NFL_Train_Total_Model
+NFL_Train_Total_Model.cv = cvFit(NFL_Train_Total_Model, data=NFL_DATA_TRAIN_Filtered_Final, y=NFL_DATA_TRAIN_Filtered_Final$Yards, K=10, seed = 123)
+NFL_Train_Total_Model.cv # RMSE= 6.388  # May have collinearity
+NFL_Train_Total_Model$coefficients
+```
+
+# What if we always predicted the mean of yards? (Just Intercept Term)
+``` {r}
+NFL_Train_Total_Model1 = lm(Yards ~ 1, data=NFL_DATA_TRAIN_Filtered_Final)
+NFL_Train_Total_Model1.cv = cvFit(NFL_Train_Total_Model1, data=NFL_DATA_TRAIN_Filtered_Final, y=NFL_DATA_TRAIN_Filtered_Final$Yards, K=10, seed = 123)
+NFL_Train_Total_Model1.cv # RMSE= 6.4191 
+``` 
+
+
+# Forward Stepwise Regression
+
+```{r}
+min_model = NFL_Train_Total_Model1
+max_model = NFL_Train_Total_Model
+stepwise_model = step(min_model, direction='forward', scope=max_model)
+summary(stepwise_model)
+# Ultimately, this is saying that the extra info we gain is not worth the complexity
+```
+
+# Backward Stepwise Regerssion
+``` {r}
+backward_step = step(max_model, direction='backward')
+backward_step 
+```
+``` {r}
+backward_step.cv = cvFit(backward_step, data=NFL_DATA_TRAIN_Filtered_Final, y=NFL_DATA_TRAIN_Filtered_Final$Yards, K=10, seed = 123)
+backward_step.cv # RMSE= 6.5386 # Best Model so far
+```
+
+# Ridge Regression
+```{r}
+library(glmnet)
+## NORMALIZE Continouous Covariates # Will have to normalize defenders in box if we make continuous
+Standardized_NFL_TRAIN = NFL_DATA_TRAIN_Filtered_Final
+Standardized_NFL_TRAIN$X = scale(Standardized_NFL_TRAIN$X)
+Standardized_NFL_TRAIN$Y = scale(Standardized_NFL_TRAIN$Y)
+Standardized_NFL_TRAIN$GameClock = scale(Standardized_NFL_TRAIN$GameClock )
+Standardized_NFL_TRAIN$Distance = scale(Standardized_NFL_TRAIN$Distance)
+Standardized_NFL_TRAIN$PlayerHeight = scale(Standardized_NFL_TRAIN$PlayerHeight)
+Standardized_NFL_TRAIN$PlayerWeight = scale(Standardized_NFL_TRAIN$PlayerWeight)
+Standardized_NFL_TRAIN$Week = scale(Standardized_NFL_TRAIN$Week)
+Standardized_NFL_TRAIN$Temperature = scale(Standardized_NFL_TRAIN$Temperature)
+Standardized_NFL_TRAIN$Humidity = scale(Standardized_NFL_TRAIN$Humidity)
+Standardized_NFL_TRAIN$TimeDifference = scale(Standardized_NFL_TRAIN$TimeDifference)
+Standardized_NFL_TRAIN$HomeScoreAdvantage = scale(Standardized_NFL_TRAIN$HomeScoreAdvantage )
+Standardized_NFL_TRAIN$PlayerAge = scale(Standardized_NFL_TRAIN$PlayerAge)
+
+# Ridge Regression 
+# Ridge alpha = 0
+x = model.matrix(Yards~. , Standardized_NFL_TRAIN)
+y = Standardized_NFL_TRAIN$Yards
+ridge_mod = glmnet(x, y, alpha = 0)
+# install.packages("plotmo")
+plot_glmnet(ridge_mod, label = TRUE) 
+```
+
+``` {r}
+cvfit = cv.glmnet(x, y, alpha = 0)
+plot(cvfit) 
+bestlam = cvfit$lambda.min # = 4.9384
+```
+
+# Get coefficients when log lamda is 10.098
+
+```{r}
+y_predicted <- predict(cvfit, s = bestlam, newx = x) # same x, in sample prediction
+ridge_RMSE = sqrt(mean((y_predicted - y)^2))
+# ridge_RMSE # = 6.3333
+coef(ridge_mod)[,4.9384] # Best is again basically forcing all the betas to 0. Just predict mean
+
+```
+
+# Lasso Regression
+
+```{r}
+lasso_mod= glmnet(x, y, alpha = 1)
+# coef(lasso_mod)[,50]
+plot_glmnet(lasso_mod, label = TRUE)
+```
+
+``` {r}
+cvfit_lasso = cv.glmnet(x, y, alpha = 1)
+plot(cvfit_lasso) 
+bestlam_lasso = cvfit_lasso$lambda.min # = 0.046056
+```
+
+``` {r}
+y_predicted_lasso <- predict(cvfit_lasso, s = bestlam_lasso, newx = x) # same x, in sample prediction
+lasso_RMSE = sqrt(mean((y_predicted_lasso - y)^2))
+lasso_RMSE # = 6.3349
+```
+
+``` {r}
+out = glmnet(x, y, alpha = 1) # Fit ridge regression model on full dataset
+predict(out, type = "coefficients", s = bestlam_lasso)[1:80,] # Display coefficients using lambda chosen by CV. Forces everything to 0
+```
+
+
+
+# Classification. Outcome Variable: NFL Yards >= distance. (Whether or not they get a first down)
+
+# With all Covariates
+```{r}
+NFL_Train_Total_Model_c <- NFL_DATA_TRAIN_Filtered_Final
+NFL_Train_Total_Model_c$FirstDown <- ifelse(
+  NFL_Train_Total_Model_c$Yards >= NFL_Train_Total_Model_c$Distance, 1, 0)
+NFL_Train_Total_Model_c$FirstDown <-
+  factor(NFL_Train_Total_Model_c$FirstDown)
+NFL_Train_Total_Model_c <- select(NFL_Train_Total_Model_c, -Yards) #remove colinear response variable from regression
+```
+
+# Implementing Cross-Fold Validation for Classification
+```{r}
+set.seed(122)
+f <- createFolds(y=NFL_Train_Total_Model_c$FirstDown, k=10)
+train_fold <- function (i) {
+  NFL_Train_Total_Model_c[-unlist(f[i]),]
+}
+
+test_fold <- function (i) {
+  NFL_Train_Total_Model_c[unlist(f[i]),]
+}
+
+```
+
+# Baseline model
+```{r}
+accuracyR <- c()
+
+for (i in 1:10) {
+  glm_Model = glm(FirstDown ~ ., data=train_fold(i), 
+                              family = binomial)
+  predict_result <- predict(glm_Model, newdata=test_fold(i), type="response")
+  predict_logit <- ifelse(predict_result > 0.5, 1, 0)
+  t <- table(predict_logit, test_fold(i)$FirstDown)
+  accuracyR[i] = (t[1,1]+t[2,2])/dim(test_fold(i))[1]
+}
+cat("Mean accuracy of 10-fold validation is: ", mean(accuracyR), "\n")
+#print(mean(accuracyR)) #0.81585
+confusionMatrix(test_fold(i)$FirstDown, factor(predict_logit))
+```
+
+Why you don't use in-prediction error - biased -lower error or higher accuracy
+```{r eval=FALSE}
+  glm_Model = glm(FirstDown ~ ., data=NFL_Train_Total_Model_c, 
+                              family = binomial)
+  predict_result <- predict(glm_Model, newdata=NFL_Train_Total_Model_c, type="response")
+  predict_logit <- ifelse(predict_result > 0.5, 1, 0)
+  t <- table(predict_logit, NFL_Train_Total_Model_c$FirstDown)
+  accuracyR = (t[1,1]+t[2,2])/dim(NFL_Train_Total_Model_c)[1] #0.82438
+```
+
+#Penalized Logistic Regression
+#Ridge
+
+error in prediction
+new method or smthg LOL
+```{r, eval=FALSE}
+#reuse standardized covarites from lasso in regresion
+standardized_new <- Standardized_NFL_TRAIN
+standardized_new$FirstDown <- NFL_Train_Total_Model_c$FirstDown
+standardized_new <- select(standardized_new, -Yards) #remove colinear variable 
+```
+
+```{r, eval=FALSE}
+  x = model.matrix(FirstDown~., standardized_new)
+  y = standardized_new$FirstDown
+  cvfit_ridge = cv.glmnet(x, y, alpha = 0, family="binomial")
+  #plot(cvfit_ridge) 
+  lam = cvfit_ridge$lambda.min #
+  model <- glmnet(x, y, alpha = 0, family = "binomial",
+                lambda = lam)
+```
+
+```{r, eval=FALSe}
+x_pred = model.matrix(~. - FirstDown, standardized_new)
+
+y_predicted <- model %>% predict(newx = x_pred) # same x, in sample prediction
+
+  predict_logit <- ifelse(y_predicted > 0.5, 1, 0)
+  t <- table(predict_logit, standardized_new$FirstDown)
+  accuracyR <- (t[1,1]+t[2,2])/dim(standardized_new)[1]  
+
+  confusionMatrix(standardized_new$FirstDown, factor(predict_logit))
+
+```
+
+# Lasso
+```{r, eval=FALSE}
+lasso_mod= glmnet(x, y, alpha = 1)
+
+```
+
+# SVM 
+would time out. have to use parallelSVM
+
+```{r}
+accuracyR <- c()
+for (i in 1:10) {
+  parallel_svm = parallelSVM(FirstDown ~ ., data=train_fold(i),
+                             numberCores=3, 
+                             kernel="radial", cost = 1, gamma = 0.05)
+  predict_result <- predict(parallel_svm, 
+                            newdata=test_fold(i), type="response")
+  t <- table(predict_result, test_fold(i)$FirstDown)
+  accuracyR[i] = (t[1,1]+t[2,2])/dim(test_fold(i))[1]
+}
+cat("Mean accuracy of 10-fold validation is: ", mean(accuracyR))
+#print(mean(accuracyR)) #0.81483
+confusionMatrix(test_fold(i)$FirstDown, factor(predict_result))
+```
+
+did not use KNN because of factor covariates
+
+# Ada
+```{r}
+accuracyR <- c()
+dat <- NULL
+for (i in 1:10) {
+  ada_fits <- ada(FirstDown ~ ., data = train_fold(i), iter = 50, 
+                  type="discrete", loss="exponential", nu=1)
+  predict_ada <- predict(ada_fits, newdata=test_fold(i))
+  t <- table(predict_ada, test_fold(i)$FirstDown)
+  accuracyR[i] = (t[1,1]+t[2,2])/dim(test_fold(i))[1]
+}
+cat("Mean accuracy of 10-fold validation is: ", mean(accuracyR))
+#print(mean(accuracyR)) #0.81251
+confusionMatrix(test_fold(i)$FirstDown, factor(predict_ada))
+```
+
