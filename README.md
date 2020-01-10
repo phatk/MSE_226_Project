@@ -1,8 +1,9 @@
 # MSE 226 Project with Professor Ramesh
 
 # Files: 
-minip1.pdf + minip2.pdf - pdf of assignments
-226-p1-final and 226-p2-final - reports
+minip1.pdf + minip2.pdf - pdf of assignments \n
+
+226-p1-final and 226-p2-final - reports \n
 p1_prediction_final.Rmd, p1_prediction_final.pdf, p2_inference_final.Rmd, p2_inference_final.pdf - codes in pdf and R markdown
 
 # Descriptions:
