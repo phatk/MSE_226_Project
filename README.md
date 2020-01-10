@@ -1,12 +1,13 @@
 # MSE 226 Project with Professor Ramesh
 
-# Files: 
-minip1.pdf + minip2.pdf - pdf of assignments \n
+# Files: <br />
+minip1.pdf + minip2.pdf - pdf of assignments <br />
 
-226-p1-final and 226-p2-final - reports \n
+226-p1-final and 226-p2-final - reports <br />
+
 p1_prediction_final.Rmd, p1_prediction_final.pdf, p2_inference_final.Rmd, p2_inference_final.pdf - codes in pdf and R markdown
 
-# Descriptions:
+# Descriptions: <br />
 We had to train a dataset after splitting into training and testing set and build the ‘best’ predictive model for regression and classification tasks.
 
 If best model is defined in terms of lowest error, 
